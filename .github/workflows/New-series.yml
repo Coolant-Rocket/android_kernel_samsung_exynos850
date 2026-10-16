@@ -1,0 +1,365 @@
+name: Hyouka Kernel Builder (Non-GKI Samsung)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Kernel source repo (owner/name)"
+        required: true
+        default: "Samsung-Galaxy-A13-A135F-Development/android_kernel_samsung_exynos850"
+      kernel_branch:
+        description: "Branch (empty = repo default)"
+        required: false
+        default: "lineage-24.0"
+      defconfig:
+        description: "Defconfig (A13 / A135F = exynos850-a13nsxx_defconfig)"
+        required: true
+        default: "exynos850-a13nsxx_defconfig"
+      selinux_default:
+        description: "SELinux mode the kernel boots with"
+        type: choice
+        options:
+          - enforcing
+          - permissive
+        default: enforcing
+      bakasu_repo:
+        description: "BakaSU repo (owner/name). Point at your own fork/mirror if upstream disappears"
+        required: true
+        default: "Baka-SU/BakaSU"
+      backport_path_umount:
+        description: "Also backport path_umount into fs/namespace.c (BakaSU already ships a fallback)"
+        type: boolean
+        default: false
+      bakasu_ref:
+        description: "BakaSU branch/tag/commit (empty = repo default branch)"
+        required: false
+        default: ""
+
+env:
+  KERNEL_NAME: Hyouka
+  ARCH: arm64
+  TZ: UTC
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_branch }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio zip unzip curl git \
+            lz4 xz-utils python3 make rsync dwarves libncurses-dev \
+            patchelf libarchive-tools ca-certificates \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Fetch latest Neutron Clang (antman)
+        run: |
+          mkdir -p "$HOME/neutron"
+          cd "$HOME/neutron"
+          bash <(curl -fsSL https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman) -S
+          echo "$HOME/neutron/bin" >> "$GITHUB_PATH"
+          "$HOME/neutron/bin/clang" --version | tee "$GITHUB_WORKSPACE/clang-version.txt"
+
+      - name: Integrate BakaSU (formerly ReSukiSU)
+        working-directory: kernel
+        run: |
+          # BakaSU's own setup.sh hardcodes a clone of Baka-SU/BakaSU, so do what it does by
+          # hand from the repo you pick (bakasu_repo). Kbuild needs a REAL, full git clone
+          # (it checks ../.git and counts commits for the version), so no --depth.
+          git clone "https://github.com/${{ inputs.bakasu_repo }}" KernelSU
+          if [ -n "${{ inputs.bakasu_ref }}" ]; then git -C KernelSU checkout "${{ inputs.bakasu_ref }}"; fi
+          git -C KernelSU log -1 --format='BakaSU commit: %h %s'
+
+          ln -sf ../KernelSU/kernel drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || python3 - <<'PY'
+          p = "drivers/Kconfig"
+          s = open(p).read()
+          i = s.rfind("endmenu")
+          assert i >= 0, "no endmenu in drivers/Kconfig"
+          open(p, "w").write(s[:i] + 'source "drivers/kernelsu/Kconfig"\n' + s[i:])
+          PY
+          tail -n 3 drivers/Kconfig
+          test -f drivers/kernelsu/Kconfig || { echo "::error::BakaSU integration failed"; exit 1; }
+
+      - name: Snapshot BakaSU source (backup in case upstream is removed)
+        working-directory: kernel
+        run: |
+          tar -czf "$GITHUB_WORKSPACE/bakasu-source-snapshot.tar.gz" KernelSU
+          ls -lh "$GITHUB_WORKSPACE/bakasu-source-snapshot.tar.gz"
+
+      - name: Apply BakaSU manual hooks + SELinux exports (4.19)
+        working-directory: kernel
+        env:
+          BACKPORT_PATH_UMOUNT: ${{ inputs.backport_path_umount }}
+        run: |
+          # Implements https://bakasu.org/guide/manual-integrate for a 4.19 tree.
+          # Idempotent: files that already contain the hooks are left alone.
+          # input / setuid / init.rc hooks are handled by the KSU_MANUAL_HOOK_AUTO_* configs.
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          def rd(p): return pathlib.Path(p).read_text()
+          def wr(p, s): pathlib.Path(p).write_text(s)
+          def fail(m):
+              print("::error::" + m); sys.exit(1)
+
+          def add_externs(s, block):
+              # place after the last #include at preprocessor depth 0
+              depth, pos, best = 0, 0, None
+              for line in s.splitlines(keepends=True):
+                  t = line.strip()
+                  if re.match(r'#\s*(if|ifdef|ifndef)\b', t): depth += 1
+                  elif re.match(r'#\s*endif\b', t): depth -= 1
+                  elif depth == 0 and re.match(r'#\s*include\b', t): best = pos + len(line)
+                  pos += len(line)
+              if best is None: fail("no top-level #include found to anchor externs")
+              return s[:best] + "\n" + block + s[best:]
+
+          def insert_before(s, start_marker, anchor, text, what):
+              i = s.find(start_marker)
+              if i < 0: fail("%s: '%s' not found" % (what, start_marker))
+              j = s.find(anchor, i)
+              if j < 0: fail("%s: anchor '%s' not found" % (what, anchor.strip()))
+              return s[:j] + text + s[j:]
+
+          # ---- fs/stat.c ----
+          p = "fs/stat.c"; s = rd(p)
+          if "ksu_handle_stat" not in s:
+              a = "\terror = vfs_fstatat(dfd, filename, &stat, flag);\n"
+              if a not in s: fail("fs/stat.c: vfs_fstatat call not found")
+              s = s.replace(a, "#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_stat((int *)&dfd, &filename, &flag);\n#endif\n" + a)
+              s = insert_before(s, "SYSCALL_DEFINE2(newfstat,", "\treturn error;",
+                  "#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_newfstat_ret(&fd, &statbuf);\n#endif\n", "newfstat")
+              # A135F userspace is 32-bit: hook fstat64's return too (32-bit su)
+              if "SYSCALL_DEFINE2(fstat64," in s:
+                  s = insert_before(s, "SYSCALL_DEFINE2(fstat64,", "\treturn error;",
+                      "#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_fstat64_ret(&fd, &statbuf);\n#endif\n", "fstat64")
+              else:
+                  print("::warning::fstat64 not found - 32-bit su may not work")
+              s = add_externs(s, "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                  "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+                  "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);\n"
+                  "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)\n"
+                  "extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);\n#endif\n#endif\n")
+              wr(p, s)
+
+          # ---- fs/exec.c (do_execve / compat_do_execve wrappers, 4.19 has no __do_execve_file) ----
+          p = "fs/exec.c"; s = rd(p)
+          if "ksu_handle_execveat" not in s:
+              a = "\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n"
+              if a not in s: fail("fs/exec.c: do_execve wrapper not found")
+              hook = ("#ifdef CONFIG_KSU_MANUAL_HOOK\n\t{\n\t\tint retval;\n"
+                  "\t\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n"
+                  "\t\tretval = do_execveat_common(AT_FDCWD, filename, argv, envp, 0);\n"
+                  "\t\tksu_handle_post_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0, &retval);\n"
+                  "\t\treturn retval;\n\t}\n#endif\n")
+              s = s.replace(a, hook + a)   # do_execve and compat_do_execve
+              s = add_externs(s, "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                  "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
+                  "extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags, int *retval);\n#endif\n")
+              wr(p, s)
+
+          # ---- fs/open.c (faccessat) ----
+          p = "fs/open.c"; s = rd(p)
+          if "ksu_handle_faccessat" not in s:
+              h = "#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n"
+              if "long do_faccessat(" in s:
+                  i = s.find("SYSCALL_DEFINE3(faccessat,")
+                  if i < 0: fail("fs/open.c: faccessat syscall not found")
+                  j = s.find("{\n", i) + 2
+                  s = s[:j] + h + s[j:]
+              else:
+                  s = insert_before(s, "SYSCALL_DEFINE3(faccessat,", "\tif (mode & ~S_IRWXO)", h + "\n", "faccessat")
+              s = add_externs(s, "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                  "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n")
+              wr(p, s)
+
+          # ---- kernel/reboot.c ----
+          p = "kernel/reboot.c"; s = rd(p)
+          if "ksu_handle_sys_reboot" not in s:
+              s = insert_before(s, "SYSCALL_DEFINE4(reboot,",
+                  "\t/* We only trust the superuser with rebooting the system. */\n",
+                  "#ifdef CONFIG_KSU_MANUAL_HOOK\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n", "reboot")
+              s = add_externs(s, "#ifdef CONFIG_KSU_MANUAL_HOOK\n"
+                  "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n")
+              wr(p, s)
+
+          # ---- fs/namespace.c: optional in-tree path_umount backport (5.9) ----
+          # BakaSU's kernel_compat.c already provides a weak fallback for kernels < 5.9,
+          # so this is off by default; a strong in-tree definition overrides the weak one.
+          import os
+          p = "fs/namespace.c"; s = rd(p)
+          if os.environ.get("BACKPORT_PATH_UMOUNT") == "true" and re.search(r'^int\s+path_umount\(', s, re.M) is None:
+              back = (
+                  "static int can_umount(const struct path *path, int flags)\n{\n"
+                  "\tstruct mount *mnt = real_mount(path->mnt);\n\n"
+                  "\tif (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))\n\t\treturn -EINVAL;\n"
+                  "\tif (!may_mount())\n\t\treturn -EPERM;\n"
+                  "\tif (path->dentry != path->mnt->mnt_root)\n\t\treturn -EINVAL;\n"
+                  "\tif (!check_mnt(mnt))\n\t\treturn -EINVAL;\n"
+                  "\tif (mnt->mnt.mnt_flags & MNT_LOCKED)\n\t\treturn -EINVAL;\n"
+                  "\tif (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))\n\t\treturn -EPERM;\n"
+                  "\treturn 0;\n}\n\n"
+                  "/* caller is responsible for flags being sane */\n"
+                  "int path_umount(struct path *path, int flags)\n{\n"
+                  "\tstruct mount *mnt = real_mount(path->mnt);\n\tint ret;\n\n"
+                  "\tret = can_umount(path, flags);\n\tif (!ret)\n\t\tret = do_umount(mnt, flags);\n\n"
+                  "\t/* we mustn't call path_put() as that would clear mnt_expiry_mark */\n"
+                  "\tdput(path->dentry);\n\tmntput_no_expire(mnt);\n\treturn ret;\n}\n\n")
+              i = s.find("SYSCALL_DEFINE2(umount,")
+              if i < 0: fail("fs/namespace.c: umount syscall not found for path_umount backport")
+              s = s[:i] + back + s[i:]
+              wr(p, s); print("backported path_umount")
+
+          # ---- SELinux static symbol exports (also covered by CONFIG_KALLSYMS_ALL) ----
+          def unstatic(p, pattern, name):
+              s = rd(p)
+              n = len(re.findall(pattern, s, re.M))
+              if n:
+                  wr(p, re.sub(pattern, lambda m: m.group(0).replace("static ", "", 1), s, flags=re.M))
+                  print("exported:", name, "(%d place(s))" % n)
+              else:
+                  print("::notice::%s: no static '%s' (already exported, or KALLSYMS_ALL covers it)" % (p, name))
+          sf = "security/selinux/selinuxfs.c"; sv = "security/selinux/ss/services.c"
+          unstatic(sf, r'^static ssize_t \(\*(const )?write_op\[\]\)', "write_op")
+          unstatic(sf, r'^static const struct file_operations sel_handle_status_ops\b', "sel_handle_status_ops")
+          unstatic(sv, r'^static void security_dump_masked_av\(', "security_dump_masked_av")
+          unstatic(sv, r'^static void context_struct_compute_av\(', "context_struct_compute_av")
+          print("hooks applied")
+          PY
+          git --no-pager diff --stat || true
+
+      - name: Check BakaSU manual hooks are in the source
+        working-directory: kernel
+        run: |
+          # Non-GKI = Manual Hook mode. BakaSU fails the build if any required hook is
+          # missing, so check early. https://bakasu.org/guide/manual-integrate
+          missing=0
+          check() { grep -q "$2" "$1" 2>/dev/null || { echo "::error::missing hook '$2' in $1"; missing=1; }; }
+          check fs/stat.c        ksu_handle_stat
+          check fs/stat.c        ksu_handle_newfstat_ret
+          check fs/exec.c        ksu_handle_execveat
+          check fs/exec.c        ksu_handle_post_execveat
+          check fs/open.c        ksu_handle_faccessat
+          check kernel/reboot.c  ksu_handle_sys_reboot
+          grep -qE '^int[[:space:]]+path_umount\(' fs/namespace.c || echo "::notice::no in-tree path_umount; using BakaSU's weak fallback"
+          grep -q ksu_handle_fstat64_ret fs/stat.c || echo "::warning::fstat64 hook missing (32-bit su)"
+          if [ "$missing" = 1 ]; then
+            echo "Commit the required hooks to your kernel branch first."; exit 1
+          fi
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          # The A13 config was generated with LLVM=1 (AS_IS_LLVM / LD_IS_LLD), so keep it and
+          # also name the LLVM binutils explicitly in case the Makefile ignores LLVM=1.
+          # A135F has 32-bit userspace on a 64-bit kernel -> CONFIG_COMPAT + the arm32 vdso toolchain.
+          MAKE_ARGS="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
+          echo "MAKE_ARGS=$MAKE_ARGS" >> "$GITHUB_ENV"
+
+          make $MAKE_ARGS "${{ inputs.defconfig }}"
+
+          # --- Root: BakaSU, Manual Hook mode (required for non-GKI 4.19) ---
+          # KALLSYMS_ALL avoids having to un-static the SELinux symbols by hand;
+          # AUTO_* let BakaSU hook input/setuid/init.rc itself (kernel <= 6.8).
+          scripts/config --file out/.config \
+            -e KSU \
+            -e KSU_MANUAL_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+            -e OVERLAY_FS \
+            -e KEYS \
+            -d KPROBES \
+            -e DEBUG_KERNEL \
+            -e KALLSYMS \
+            -e KALLSYMS_ALL
+
+          # --- SELinux: enforcing/permissive switchable ---
+          # In this 4.19 tree the boot mode comes from the kernel's enforcing= parameter
+          # (SECURITY_SELINUX_DEVELOP); runtime switching is /sys/fs/selinux/enforce or setenforce.
+          # The A13 defconfig sets SECURITY_SELINUX_ALWAYS_PERMISSIVE=y, which blocks enforcing,
+          # so it (and ALWAYS_ENFORCE, which blocks permissive) must both be off.
+          scripts/config --file out/.config \
+            -e SECURITY_SELINUX \
+            -e SECURITY_SELINUX_DEVELOP \
+            -d SECURITY_SELINUX_ALWAYS_PERMISSIVE \
+            -d SECURITY_SELINUX_ALWAYS_ENFORCE
+
+          # The defconfig also hardcodes CONFIG_CMDLINE="androidboot.selinux=permissive" with
+          # CMDLINE_EXTEND, which is appended after the bootloader cmdline and would force
+          # permissive on every boot. Replace it with the mode you picked.
+          if [ "${{ inputs.selinux_default }}" = "enforcing" ]; then
+            scripts/config --file out/.config --set-str CMDLINE "androidboot.selinux=enforcing enforcing=1"
+          else
+            scripts/config --file out/.config --set-str CMDLINE "androidboot.selinux=permissive enforcing=0"
+          fi
+          scripts/config --file out/.config -e CMDLINE_EXTEND
+
+          # Kernel name
+          scripts/config --file out/.config --set-str LOCALVERSION "-${KERNEL_NAME}"
+          scripts/config --file out/.config -d LOCALVERSION_AUTO
+
+          make $MAKE_ARGS olddefconfig
+
+          echo "=== Verify key options ==="
+          grep -E "CONFIG_CMDLINE=|CONFIG_COMPAT=|CONFIG_KSU|CONFIG_KALLSYMS_ALL|CONFIG_SECURITY_SELINUX" out/.config
+          grep -q "^CONFIG_KEYS=y" out/.config || { echo "::error::CONFIG_KEYS missing (needed by BakaSU keyring code)"; exit 1; }
+          grep -q "^CONFIG_KSU=y" out/.config || { echo "::error::CONFIG_KSU was dropped by olddefconfig"; exit 1; }
+          grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config || { echo "::error::CONFIG_KSU_MANUAL_HOOK was dropped"; exit 1; }
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export KBUILD_BUILD_USER="${KERNEL_NAME}"
+          export KBUILD_BUILD_HOST="github-actions"
+          # Neutron is far newer than the clang-r353983c this tree was built with:
+          # keep new-compiler warnings/default-errors from failing 4.19 code.
+          make -j"$(nproc)" $MAKE_ARGS KCFLAGS="-Wno-error -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-function-pointer-types -Wno-implicit-int" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          test -f out/arch/arm64/boot/Image || { echo "Image not produced"; exit 1; }
+          ls -la out/arch/arm64/boot/dts/exynos/exynos3830.dtb out/arch/arm64/boot/dts/samsung/a13/*.dtbo 2>/dev/null || echo "WARNING: expected dtb/dtbo not produced"
+
+      - name: Package (AnyKernel3 zip)
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
+          # NOTE: edit AnyKernel3/anykernel.sh for your device if you flash via recovery.
+          cd AnyKernel3
+          rm -rf .git
+          zip -r9 "../${KERNEL_NAME}-${{ inputs.selinux_default }}-$(date +%Y%m%d).zip" . -x "*.md"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KERNEL_NAME }}-kernel
+          path: |
+            ${{ env.KERNEL_NAME }}-*.zip
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/arch/arm64/boot/dts/exynos/exynos3830.dtb
+            kernel/out/arch/arm64/boot/dts/samsung/a13/*.dtbo
+            kernel/out/.config
+            clang-version.txt
+            bakasu-source-snapshot.tar.gz
+            build.log
+          if-no-files-found: warn
